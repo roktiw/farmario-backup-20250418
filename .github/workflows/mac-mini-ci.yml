@@ -1,0 +1,102 @@
+name: Mac mini CI
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master, codex/mac-mini-ci]
+permissions:
+  contents: read
+concurrency:
+  group: mac-mini-ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  verify:
+    name: "Static application JavaScript syntax and extension manifests; browser interaction NOT_RUN"
+    runs-on: [mac-mini-m4, macos-arm64]
+    timeout-minutes: 40
+    env:
+      CI: "true"
+      HUSKY: "0"
+      NEXT_TELEMETRY_DISABLED: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Host receipt
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          echo "Runner: $RUNNER_NAME; source: $GITHUB_SHA"
+          sw_vers
+          echo "Scope: Static application JavaScript syntax and extension manifests; browser interaction NOT_RUN" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - name: "1. node - <<'CHECK'"
+        run: |
+          set -euo pipefail
+          node - <<'CHECK'
+          const cp=require('node:child_process'),fs=require('node:fs');
+          const files=cp.execFileSync('git',['ls-files','-z']).toString().split('\0').filter(Boolean);
+          const js=files.filter(p=>p.endsWith('.js')&&!p.includes('node_modules/')&&!p.endsWith('.min.js'));
+          for(const p of js)cp.execFileSync(process.execPath,['--check',p],{stdio:'inherit'});
+          const manifests=files.filter(p=>/(^|\/)manifest\.json$/.test(p));
+          for(const p of manifests)JSON.parse(fs.readFileSync(p,'utf8'));
+          if(!js.length&&!manifests.length&&!files.some(p=>p.endsWith('.html')))throw Error('No static app sources');
+          console.log('JavaScript files checked:',js.length,'extension manifests:',manifests.length);
+          console.log('Browser interaction: NOT_RUN');
+          CHECK
+      - name: HTML inline JavaScript syntax
+        run: |
+          /opt/homebrew/bin/python3.14 - <<'CHECK'
+          from html.parser import HTMLParser
+          from pathlib import Path
+          import subprocess
+          class Scripts(HTMLParser):
+           def __init__(self):super().__init__();self.current=None;self.items=[]
+           def handle_starttag(self,tag,attrs):
+            if tag=='script':
+             a=dict(attrs);kind=a.get('type','').lower()
+             self.current=[kind,[]] if 'src' not in a and kind in ('','text/javascript','application/javascript','module') else None
+           def handle_data(self,data):
+            if self.current is not None:self.current[1].append(data)
+           def handle_endtag(self,tag):
+            if tag=='script' and self.current is not None:self.items.append(self.current);self.current=None
+          files=[Path(p) for p in subprocess.check_output(['git','ls-files','-z']).decode().split('\0') if p.endswith('.html')]
+          count=0
+          for f in files:
+           parser=Scripts();parser.feed(f.read_text(encoding='utf-8-sig'))
+           for kind,chunks in parser.items:
+            args=['node','--check']+(['--input-type=module'] if kind=='module' else [])
+            subprocess.run(args,input=''.join(chunks),text=True,check=True);count+=1
+          print('HTML inline JavaScript syntax checks:',count)
+          CHECK
+      - name: Preserve reports on this Mac
+        if: always()
+        run: |
+          set -euo pipefail
+          destination="$HOME/.local/share/github-ci-reports/$GITHUB_REPOSITORY/$GITHUB_RUN_ID"
+          mkdir -p "$destination"
+          printf '%s\n' "$GITHUB_SHA" > "$destination/source.sha"
+          for item in mac-ci-tests.xml test-results playwright-report; do
+            if [[ -e "$item" ]]; then cp -R "$item" "$destination/"; fi
+          done
+          echo "Local reports: $destination" >> "$GITHUB_STEP_SUMMARY"
+      - name: Optional GitHub artifact upload
+        if: always() && vars.MAC_CI_UPLOAD_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mac-mini-ci-${{ github.run_id }}
+          path: |
+            mac-ci-tests.xml
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Remove job dependency trees
+        if: always()
+        run: git clean -ffdx -- node_modules apps/web/node_modules .ci-venv
